@@ -1,0 +1,21 @@
+#!/sbin/sh
+umask 022
+
+ui_print() { echo "$1"; }
+
+OUTFD=$2
+ZIPFILE=$3
+
+mount /data 2>/dev/null
+
+TMPDIR=/dev/tmp
+[ ! -d $TMPDIR ] && TMPDIR=/tmp
+
+unzip -o "$ZIPFILE" -d "$TMPDIR" >&2
+
+if [ -f "$TMPDIR/customize.sh" ]; then
+  . "$TMPDIR/customize.sh"
+else
+  ui_print " customize.sh not found!"
+  exit 1
+fi
