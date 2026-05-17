@@ -1,0 +1,72 @@
+#!/system/bin/sh
+# QTUN Firewall Rules
+MODDIR="/data/adb/QTUN"
+
+ARCH=$(getprop ro.product.cpu.abi 2>/dev/null)
+[ -z "$ARCH" ] && ARCH=$(uname -m)
+case "$ARCH" in
+    armv7l|armv8l) ARCH="armeabi-v7a" ;;
+    aarch64)       ARCH="arm64-v8a" ;;
+    *)             ARCH="armeabi-v7a" ;;
+esac
+case "$ARCH" in
+    arm64*|aarch64*) BIN_ARCH="arm64" ;;
+    arm*|armeabi*)   BIN_ARCH="arm" ;;
+    *)               BIN_ARCH="arm" ;;
+esac
+
+BIN="$MODDIR/bin/$BIN_ARCH"
+JQ="$BIN/jq"
+CONF_DIR="$MODDIR/config"
+
+M_PORT=7890
+R_PORT=9797
+D_PORT=1053
+DASH_PORT=9090
+
+apply_rules() {
+    iptables -t nat -F OUTPUT 2>/dev/null
+    iptables -t nat -F PREROUTING 2>/dev/null
+
+    setprop net.dns1 127.0.0.1
+    setprop net.dns2 8.8.8.8
+    setprop net.eth0.dns1 127.0.0.1
+    setprop net.wlan0.dns1 127.0.0.1
+
+    for config_file in "$CONF_DIR"/*.json; do
+        [ ! -f "$config_file" ] && continue
+        RAW_IP=$($JQ -r '.server' "$config_file" | cut -d':' -f1)
+        SERVER=$(echo "$RAW_IP" | tr -d '"' | tr -d "'" | tr -d '[:space:]')
+        [ -n "$SERVER" ] && iptables -t nat -I OUTPUT -d "$SERVER" -j RETURN
+    done
+
+    for ADDR in 0.0.0.0/8 10.0.0.0/8 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16; do
+        iptables -t nat -I OUTPUT -d $ADDR -j RETURN
+        iptables -t nat -I PREROUTING -d $ADDR -j RETURN
+    done
+
+    iptables -t nat -I OUTPUT -d 127.0.0.1 -j RETURN
+    iptables -t nat -I OUTPUT -p tcp --dport $DASH_PORT -j RETURN
+    iptables -t nat -I PREROUTING -p tcp --dport $DASH_PORT -j RETURN
+
+    iptables -t nat -A OUTPUT -p udp --dport 53 -j REDIRECT --to-ports $D_PORT
+    iptables -t nat -A PREROUTING -p udp --dport 53 -j REDIRECT --to-ports $D_PORT
+
+    iptables -t nat -A OUTPUT -p tcp -m owner ! --uid-owner 0 -j REDIRECT --to-ports $M_PORT
+    iptables -t nat -A PREROUTING -p tcp -j REDIRECT --to-ports $R_PORT
+
+    echo "[IPTABLES] Rules applied [OK]"
+}
+
+flush_rules() {
+    iptables -t nat -F PREROUTING 2>/dev/null
+    iptables -t nat -F POSTROUTING 2>/dev/null
+    echo "[IPTABLES] Rules flushed [OK]"
+}
+
+case "$1" in
+    enable)  apply_rules ;;
+    disable) flush_rules ;;
+    renew)   flush_rules; apply_rules ;;
+    *)       echo "Usage: qtun.iptables {enable|disable|renew}" ;;
+esac

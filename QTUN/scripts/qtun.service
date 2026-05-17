@@ -1,0 +1,13 @@
+#!/system/bin/sh
+# QTUN Service Wrapper
+MODDIR="/data/adb/QTUN"
+TOOL="$MODDIR/scripts/qtun.tool"
+mkdir -p "$MODDIR/run"
+
+case "$1" in
+    start)   $TOOL start ;;
+    stop)    $TOOL stop ;;
+    status)  $TOOL status ;;
+    restart) $0 stop; sleep 2; $0 start ;;
+    *)       echo "Usage: $0 {start|stop|restart|status}" ;;
+esac

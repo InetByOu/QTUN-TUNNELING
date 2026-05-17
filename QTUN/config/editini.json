@@ -1,0 +1,13 @@
+{
+  "server": "ipvps:6000-19999",
+  "obfs": "hu``hqb`c",
+  "auth": "edoll",
+  "down_mbps": 200,
+  "up_mbps": 100,
+  "worker_count": 8,
+  "resolver": "8.8.8.8:53",
+  "insecure": true,
+  "recvwindowconn": 65536,
+  "recvwindow": 262144,
+  "disable_mtu_discovery": true
+}
