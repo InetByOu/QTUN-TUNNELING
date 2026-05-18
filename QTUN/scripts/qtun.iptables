@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# QTUN Firewall Rules
+# QTUN Firewall Rules - Custom Chain (Safe)
 MODDIR="/data/adb/QTUN"
 
 ARCH=$(getprop ro.product.cpu.abi 2>/dev/null)
@@ -24,43 +24,83 @@ R_PORT=9797
 D_PORT=1053
 DASH_PORT=9090
 
+# Custom chain names
+CHAIN_OUT="QTUN_OUTPUT"
+CHAIN_PRE="QTUN_PREROUTING"
+
 apply_rules() {
-    iptables -t nat -F OUTPUT 2>/dev/null
-    iptables -t nat -F PREROUTING 2>/dev/null
+    echo "[IPTABLES] Applying rules via custom chain..."
 
-    setprop net.dns1 127.0.0.1
-    setprop net.dns2 8.8.8.8
-    setprop net.eth0.dns1 127.0.0.1
-    setprop net.wlan0.dns1 127.0.0.1
+    # 1. Buat custom chain (jika belum ada)
+    iptables -t nat -N $CHAIN_OUT 2>/dev/null
+    iptables -t nat -N $CHAIN_PRE 2>/dev/null
 
-    for config_file in "$CONF_DIR"/*.json; do
+    # 2. Flush custom chain saja
+    iptables -t nat -F $CHAIN_OUT
+    iptables -t nat -F $CHAIN_PRE
+
+    # 3. Bypass IP VPS (semua config)
+    for config_file in $(ls "$CONF_DIR"/*.json 2>/dev/null | grep -v users.json); do
         [ ! -f "$config_file" ] && continue
         RAW_IP=$($JQ -r '.server' "$config_file" | cut -d':' -f1)
         SERVER=$(echo "$RAW_IP" | tr -d '"' | tr -d "'" | tr -d '[:space:]')
-        [ -n "$SERVER" ] && iptables -t nat -I OUTPUT -d "$SERVER" -j RETURN
+        [ -n "$SERVER" ] && {
+            iptables -t nat -A $CHAIN_OUT -d "$SERVER" -j RETURN
+            iptables -t nat -A $CHAIN_PRE -d "$SERVER" -j RETURN
+        }
     done
 
+    # 4. Bypass local networks
     for ADDR in 0.0.0.0/8 10.0.0.0/8 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16; do
-        iptables -t nat -I OUTPUT -d $ADDR -j RETURN
-        iptables -t nat -I PREROUTING -d $ADDR -j RETURN
+        iptables -t nat -A $CHAIN_OUT -d $ADDR -j RETURN
+        iptables -t nat -A $CHAIN_PRE -d $ADDR -j RETURN
     done
 
-    iptables -t nat -I OUTPUT -d 127.0.0.1 -j RETURN
-    iptables -t nat -I OUTPUT -p tcp --dport $DASH_PORT -j RETURN
-    iptables -t nat -I PREROUTING -p tcp --dport $DASH_PORT -j RETURN
+    # 5. Bypass dashboard & loopback
+    iptables -t nat -A $CHAIN_OUT -d 127.0.0.1 -j RETURN
+    iptables -t nat -A $CHAIN_OUT -p tcp --dport $DASH_PORT -j RETURN
+    iptables -t nat -A $CHAIN_PRE -p tcp --dport $DASH_PORT -j RETURN
 
-    iptables -t nat -A OUTPUT -p udp --dport 53 -j REDIRECT --to-ports $D_PORT
-    iptables -t nat -A PREROUTING -p udp --dport 53 -j REDIRECT --to-ports $D_PORT
+    # 6. Bypass traffic from root & specific UID (tunnel processes)
+    iptables -t nat -A $CHAIN_OUT -m owner --uid-owner 0 -j RETURN
+    iptables -t nat -A $CHAIN_OUT -m owner --uid-owner 3004 -j RETURN  # clash GID
 
-    iptables -t nat -A OUTPUT -p tcp -m owner ! --uid-owner 0 -j REDIRECT --to-ports $M_PORT
-    iptables -t nat -A PREROUTING -p tcp -j REDIRECT --to-ports $R_PORT
+    # 7. Redirect DNS (UDP + TCP)
+    iptables -t nat -A $CHAIN_OUT -p udp --dport 53 -j REDIRECT --to-ports $D_PORT
+    iptables -t nat -A $CHAIN_OUT -p tcp --dport 53 -j REDIRECT --to-ports $D_PORT
+    iptables -t nat -A $CHAIN_PRE -p udp --dport 53 -j REDIRECT --to-ports $D_PORT
+    iptables -t nat -A $CHAIN_PRE -p tcp --dport 53 -j REDIRECT --to-ports $D_PORT
+
+    # 8. Redirect TCP ke Clash (OUTPUT & PREROUTING)
+    iptables -t nat -A $CHAIN_OUT -p tcp -j REDIRECT --to-ports $R_PORT
+    iptables -t nat -A $CHAIN_PRE -p tcp -j REDIRECT --to-ports $R_PORT
+
+    # 9. Pasang custom chain ke chain utama (jika belum ada)
+    iptables -t nat -C OUTPUT -j $CHAIN_OUT 2>/dev/null || iptables -t nat -I OUTPUT 1 -j $CHAIN_OUT
+    iptables -t nat -C PREROUTING -j $CHAIN_PRE 2>/dev/null || iptables -t nat -I PREROUTING 1 -j $CHAIN_PRE
+
+    setprop net.dns1 127.0.0.1
+    setprop net.dns2 8.8.8.8
 
     echo "[IPTABLES] Rules applied [OK]"
 }
 
 flush_rules() {
-    iptables -t nat -F PREROUTING 2>/dev/null
-    iptables -t nat -F POSTROUTING 2>/dev/null
+    echo "[IPTABLES] Removing custom chain..."
+
+    # Hapus rujukan dari chain utama
+    iptables -t nat -D OUTPUT -j $CHAIN_OUT 2>/dev/null
+    iptables -t nat -D PREROUTING -j $CHAIN_PRE 2>/dev/null
+
+    # Flush & hapus custom chain
+    iptables -t nat -F $CHAIN_OUT 2>/dev/null
+    iptables -t nat -F $CHAIN_PRE 2>/dev/null
+    iptables -t nat -X $CHAIN_OUT 2>/dev/null
+    iptables -t nat -X $CHAIN_PRE 2>/dev/null
+
+    setprop net.dns1 8.8.8.8
+    setprop net.dns2 8.8.4.4
+
     echo "[IPTABLES] Rules flushed [OK]"
 }
 
