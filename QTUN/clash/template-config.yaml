@@ -8,7 +8,7 @@ external-controller: 0.0.0.0:9090
 external-ui: ./dashboard
 
 tun:
-  enable: true
+  enable: false
   stack: gvisor
   dns-hijack:
     - any:53
