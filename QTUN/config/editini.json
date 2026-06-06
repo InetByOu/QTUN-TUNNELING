@@ -1,13 +1,19 @@
 {
-  "server": "ipvps:6000-19999",
+  "server": "ipserver:6000-19999",
   "obfs": "hu``hqb`c",
-  "auth": "edoll",
-  "down_mbps": 200,
-  "up_mbps": 100,
-  "worker_count": 8,
+  "auth": "zipassword",
+  "worker_count": 4,
   "resolver": "8.8.8.8:53",
   "insecure": true,
   "recvwindowconn": 65536,
   "recvwindow": 262144,
-  "disable_mtu_discovery": true
+  "disable_mtu_discovery": true,
+  "internet_manager": {
+    "enabled": true,
+    "check_interval": 15,
+    "fail_threshold": 2,
+    "timeout": 8,
+    "test_url": "http://www.google.com",
+    "restart_on_failure": true
+  }
 }
