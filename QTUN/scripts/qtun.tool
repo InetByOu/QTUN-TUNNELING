@@ -1,17 +1,23 @@
 #!/system/bin/sh
-# QTUN Core Tool v3 - Aggregator Manager (No bash-isms)
+# QTUN Core v7 - Configurable Internet Manager (per config)
 
 MODDIR="/data/adb/QTUN"
 CONFDIR="$MODDIR/config"
 RUNDIR="$MODDIR/run"
-SCRIPTDIR="$MODDIR/scripts"
 CLASHDIR="$MODDIR/clash"
 LOGFILE="$RUNDIR/run.log"
 AGGREGATOR_MAP="$RUNDIR/aggregator_config.map"
 FAILCOUNT_DIR="$RUNDIR/failcounts"
+MANAGER_CONFIG="$RUNDIR/manager_config"
+
+# Default values (akan ditimpa oleh config.json)
+DEFAULT_CHECK_INTERVAL=20
+DEFAULT_FAIL_THRESHOLD=2
+DEFAULT_TIMEOUT=6
+DEFAULT_TEST_URL="http://www.google.com"
 
 # -------------------------------------------------------------------
-#  Setup environment & binaries
+#  Environment & binaries
 # -------------------------------------------------------------------
 ARCH=$(getprop ro.product.cpu.abi 2>/dev/null)
 [ -z "$ARCH" ] && ARCH=$(uname -m)
@@ -34,8 +40,9 @@ CURL="$BINDIR/curl"
 
 PIDFILE="$RUNDIR/qtun.pid"
 MANAGER_PIDFILE="$RUNDIR/aggregator_manager.pid"
-WORKER_MONITOR_PIDFILE="$RUNDIR/worker_monitor.pid"
+WORKER_CHECK_PIDFILE="$RUNDIR/worker_check.pid"
 ROTATE_PIDFILE="$RUNDIR/log_rotate.pid"
+INTERNET_MGR_PIDFILE="$RUNDIR/internet_manager.pid"
 
 VERSION=$(grep "^version=" "$MODDIR/../qtun_tunneling/module.prop" 2>/dev/null | cut -d= -f2)
 [ -z "$VERSION" ] && VERSION="unknown"
@@ -43,7 +50,7 @@ VERSION=$(grep "^version=" "$MODDIR/../qtun_tunneling/module.prop" 2>/dev/null |
 mkdir -p "$RUNDIR" "$FAILCOUNT_DIR"
 
 # -------------------------------------------------------------------
-#  Logging functions
+#  Logging
 # -------------------------------------------------------------------
 log_msg() { echo "[$(date '+%H:%M:%S')] $1" >> "$LOGFILE"; }
 print_info() {
@@ -56,22 +63,71 @@ cleanup_fail() {
     print_info "[FATAL] $1. Stopping all processes."
     log_msg "[FATAL] $1. Stopping all processes."
     kill "$MANAGER_PID" 2>/dev/null
-    kill "$WORKER_MONITOR_PID" 2>/dev/null
-    killall libuz libload clash 2>/dev/null
-    rm -f "$PIDFILE" "$MANAGER_PIDFILE" "$WORKER_MONITOR_PIDFILE"
+    kill "$WORKER_CHECK_PID" 2>/dev/null
+    kill "$INTERNET_MGR_PID" 2>/dev/null
+    killall -9 libuz libload clash 2>/dev/null
+    rm -f "$PIDFILE" "$MANAGER_PIDFILE" "$WORKER_CHECK_PIDFILE" "$INTERNET_MGR_PIDFILE"
     exit 1
 }
 
 show_banner() {
     echo "=========================================="
-    echo "         QTUN ZIVPN SYSTEM v$VERSION"
-    echo "         Aggregator Manager Active"
+    echo "      QTUN ZIVPN SYSTEM v$VERSION"
+    echo "   Configurable Internet Manager"
     echo "=========================================="
     echo ""
 }
 
 # -------------------------------------------------------------------
-#  Log rotator: every 10 minutes, keep last 1000 lines if too big
+#  Load internet manager settings from config files
+# -------------------------------------------------------------------
+load_manager_settings() {
+    # Reset to defaults
+    MANAGER_ENABLED=0
+    CHECK_INTERVAL=$DEFAULT_CHECK_INTERVAL
+    FAIL_THRESHOLD=$DEFAULT_FAIL_THRESHOLD
+    TIMEOUT=$DEFAULT_TIMEOUT
+    TEST_URL="$DEFAULT_TEST_URL"
+    RESTART_ON_FAILURE=1
+    
+    # Baca semua config, gunakan setting dari config pertama yang memiliki internet_manager.enabled=true
+    for config_file in $(ls "$CONFDIR"/*.json 2>/dev/null | grep -v "users\.json$"); do
+        local enabled=$($JQ -r '.internet_manager.enabled // false' "$config_file" 2>/dev/null)
+        if [ "$enabled" = "true" ]; then
+            MANAGER_ENABLED=1
+            # Ambil semua setting dari config ini
+            local tmp_interval=$($JQ -r '.internet_manager.check_interval // empty' "$config_file" 2>/dev/null)
+            local tmp_threshold=$($JQ -r '.internet_manager.fail_threshold // empty' "$config_file" 2>/dev/null)
+            local tmp_timeout=$($JQ -r '.internet_manager.timeout // empty' "$config_file" 2>/dev/null)
+            local tmp_url=$($JQ -r '.internet_manager.test_url // empty' "$config_file" 2>/dev/null)
+            local tmp_restart=$($JQ -r '.internet_manager.restart_on_failure // empty' "$config_file" 2>/dev/null)
+            
+            [ -n "$tmp_interval" ] && [ "$tmp_interval" != "null" ] && CHECK_INTERVAL=$tmp_interval
+            [ -n "$tmp_threshold" ] && [ "$tmp_threshold" != "null" ] && FAIL_THRESHOLD=$tmp_threshold
+            [ -n "$tmp_timeout" ] && [ "$tmp_timeout" != "null" ] && TIMEOUT=$tmp_timeout
+            [ -n "$tmp_url" ] && [ "$tmp_url" != "null" ] && TEST_URL="$tmp_url"
+            [ -n "$tmp_restart" ] && [ "$tmp_restart" != "null" ] && RESTART_ON_FAILURE=$tmp_restart
+            
+            print_info "[SETUP] Internet Manager enabled from $(basename "$config_file")"
+            print_info "[SETUP]   interval=${CHECK_INTERVAL}s, threshold=$FAIL_THRESHOLD, timeout=${TIMEOUT}s"
+            print_info "[SETUP]   test_url=$TEST_URL, restart_on_failure=$RESTART_ON_FAILURE"
+            break
+        fi
+    done
+    
+    # Simpan setting ke file untuk digunakan oleh manager process
+    cat > "$MANAGER_CONFIG" << EOF
+ENABLED=$MANAGER_ENABLED
+CHECK_INTERVAL=$CHECK_INTERVAL
+FAIL_THRESHOLD=$FAIL_THRESHOLD
+TIMEOUT=$TIMEOUT
+TEST_URL=$TEST_URL
+RESTART_ON_FAILURE=$RESTART_ON_FAILURE
+EOF
+}
+
+# -------------------------------------------------------------------
+#  Log rotator
 # -------------------------------------------------------------------
 start_log_rotator() {
     (
@@ -93,241 +149,143 @@ start_log_rotator() {
 }
 
 # -------------------------------------------------------------------
-#  Helper: get/set fail count for an aggregator port
+#  Internet Manager (monitors specific aggregator, can be disabled)
 # -------------------------------------------------------------------
-get_fail_count() {
-    local port="$1"
-    local f="$FAILCOUNT_DIR/$port"
-    if [ -f "$f" ]; then
-        cat "$f" 2>/dev/null || echo 0
-    else
-        echo 0
-    fi
-}
-
-set_fail_count() {
-    local port="$1"
-    local count="$2"
-    echo "$count" > "$FAILCOUNT_DIR/$port"
-}
-
-reset_fail_count() {
-    local port="$1"
-    rm -f "$FAILCOUNT_DIR/$port"
-}
-
-# -------------------------------------------------------------------
-#  Restart workers & aggregator for a specific config
-# -------------------------------------------------------------------
-restart_aggregator_workers() {
+start_internet_manager() {
     local AGG_PORT="$1"
-    local REASON="$2"
     
-    # Find config index from port
-    local CONFIG_INDEX=$((AGG_PORT - 7777))
-    if [ $CONFIG_INDEX -lt 0 ]; then
-        print_info "[AGG-MANAGER] Invalid aggregator port $AGG_PORT"
-        return 1
-    fi
-    
-    # Get config file from mapping
-    local CONFIG_FILE=$(grep "^$AGG_PORT|" "$AGGREGATOR_MAP" 2>/dev/null | cut -d'|' -f2)
-    if [ -z "$CONFIG_FILE" ] || [ ! -f "$CONFIG_FILE" ]; then
-        print_info "[AGG-MANAGER] No config found for aggregator port $AGG_PORT"
-        return 1
-    fi
-    
-    print_info "[AGG-MANAGER] Restarting workers for aggregator $AGG_PORT (reason: $REASON)"
-    
-    local BASE_WORKER_PORT=$((1080 + CONFIG_INDEX * 1000))
-    local WORKER_COUNT=$($JQ -r '.worker_count' "$CONFIG_FILE" 2>/dev/null)
-    [ -z "$WORKER_COUNT" ] || [ "$WORKER_COUNT" = "null" ] || [ "$WORKER_COUNT" -lt 1 ] && WORKER_COUNT=4
-    local OBFS=$($JQ -r '.obfs' "$CONFIG_FILE" 2>/dev/null)
-    
-    # Kill workers in this port range (by killing libuz processes that listen on those ports)
-    for i in $(busybox seq 0 $((WORKER_COUNT - 1))); do
-        local PORT=$((BASE_WORKER_PORT + i))
-        local WPID=$(busybox netstat -tulnp 2>/dev/null | grep ":$PORT " | grep -o '[0-9]\+/libuz' | cut -d'/' -f1)
-        [ -n "$WPID" ] && kill "$WPID" 2>/dev/null
-    done
-    # Also kill any libuz that might still hold those ports (broader kill via fuser)
-    for i in $(busybox seq 0 $((WORKER_COUNT - 1))); do
-        busybox fuser -k "$((BASE_WORKER_PORT + i))/tcp" 2>/dev/null
-    done
-    sleep 2
-    
-    # Restart workers
-    for i in $(busybox seq 0 $((WORKER_COUNT - 1))); do
-        local PORT=$((BASE_WORKER_PORT + i))
-        local JSON_DATA=$($JQ --arg port "$PORT" '.socks5.listen = "127.0.0.1:\($port)"' "$CONFIG_FILE")
-        $BINDIR/libuz -s "$OBFS" --config "$JSON_DATA" >> "$LOGFILE" 2>&1 &
-        sleep 0.2
-    done
-    sleep 3
-    
-    # Restart aggregator (libload) for this port
-    local AGG_PID=$(busybox netstat -tulnp 2>/dev/null | grep ":$AGG_PORT " | grep -o '[0-9]\+/libload' | cut -d'/' -f1)
-    [ -n "$AGG_PID" ] && kill "$AGG_PID" 2>/dev/null
-    busybox fuser -k "$AGG_PORT/tcp" 2>/dev/null
-    sleep 1
-    
-    local TUNNEL_LIST=""
-    for i in $(busybox seq 0 $((WORKER_COUNT - 1))); do
-        TUNNEL_LIST="$TUNNEL_LIST 127.0.0.1:$((BASE_WORKER_PORT + i))"
-    done
-    $BINDIR/libload -lport "$AGG_PORT" -tunnel $TUNNEL_LIST >> "$LOGFILE" 2>&1 &
-    sleep 3
-    
-    if busybox nc -z 127.0.0.1 "$AGG_PORT" 2>/dev/null; then
-        print_info "[AGG-MANAGER] Aggregator $AGG_PORT restarted successfully"
+    # Load settings from config
+    if [ -f "$MANAGER_CONFIG" ]; then
+        . "$MANAGER_CONFIG"
     else
-        print_info "[AGG-MANAGER] WARNING: Aggregator $AGG_PORT restart may have failed"
+        MANAGER_ENABLED=0
     fi
-    return 0
-}
-
-# -------------------------------------------------------------------
-#  Restart ril-daemon (global recovery)
-# -------------------------------------------------------------------
-restart_rild() {
-    print_info "[AGG-MANAGER] All aggregators failed. Restarting ril-daemon..."
-    setprop ctl.restart ril-daemon 2>/dev/null || { stop ril-daemon; start ril-daemon; }
-    sleep 60
-    print_info "[AGG-MANAGER] ril-daemon restarted. Waiting for network..."
-}
-
-# -------------------------------------------------------------------
-#  Aggregator Manager - monitors all aggregators (pure sh)
-# -------------------------------------------------------------------
-start_aggregator_manager() {
+    
+    if [ "$MANAGER_ENABLED" -ne 1 ]; then
+        print_info "[INTERNET-MGR] Disabled by config (set internet_manager.enabled=true to activate)"
+        return 0
+    fi
+    
     (
-        CHECK_INTERVAL=30
-        FAIL_THRESHOLD=3
+        local fail_count=0
+        local recovering=0
         
-        # Read all aggregator ports from mapping file
-        AGG_PORTS=""
-        while IFS='|' read -r port config; do
-            AGG_PORTS="$AGG_PORTS $port"
-            # Reset fail counts on start
-            reset_fail_count "$port"
-        done < "$AGGREGATOR_MAP"
-        
-        if [ -z "$AGG_PORTS" ]; then
-            print_info "[AGG-MANAGER] No aggregators to monitor. Exiting."
-            exit 1
-        fi
-        
-        print_info "[AGG-MANAGER] Started monitoring aggregators: $AGG_PORTS (interval ${CHECK_INTERVAL}s, threshold $FAIL_THRESHOLD)"
+        print_info "[INTERNET-MGR] Started monitoring aggregator $AGG_PORT"
+        print_info "[INTERNET-MGR] Settings: interval=${CHECK_INTERVAL}s, threshold=$FAIL_THRESHOLD, timeout=${TIMEOUT}s"
         
         while true; do
-            sleep "$CHECK_INTERVAL"
+            sleep $CHECK_INTERVAL
             
-            # Stop if main process died
             if [ ! -f "$PIDFILE" ] || ! pidof clash >/dev/null; then
-                print_info "[AGG-MANAGER] QTUN core not running. Exiting."
+                print_info "[INTERNET-MGR] QTUN core not running. Exiting."
                 exit 0
             fi
             
-            ANY_ALIVE=0
-            ANY_FAILED=0
-            
-            for port in $AGG_PORTS; do
-                # Test aggregator via socks5
-                if $CURL -so /dev/null -x socks5h://127.0.0.1:"$port" --connect-timeout 5 --max-time 10 http://www.google.com 2>/dev/null; then
-                    # Success
-                    COUNT=$(get_fail_count "$port")
-                    if [ "$COUNT" -ge "$FAIL_THRESHOLD" ]; then
-                        print_info "[AGG-MANAGER] Aggregator $port recovered."
-                    fi
-                    reset_fail_count "$port"
-                    ANY_ALIVE=1
-                else
-                    COUNT=$(get_fail_count "$port")
-                    COUNT=$((COUNT + 1))
-                    set_fail_count "$port" "$COUNT"
-                    print_info "[AGG-MANAGER] Aggregator $port FAILED ($COUNT/$FAIL_THRESHOLD)"
-                    if [ "$COUNT" -ge "$FAIL_THRESHOLD" ]; then
-                        ANY_FAILED=1
-                        restart_aggregator_workers "$port" "failed $COUNT times"
-                        reset_fail_count "$port"
-                        sleep 15  # give time to stabilize
-                    fi
+            # Test internet melalui aggregator
+            if $CURL -so /dev/null -x socks5h://127.0.0.1:"$AGG_PORT" \
+                --connect-timeout $TIMEOUT --max-time $((TIMEOUT + 5)) \
+                "$TEST_URL" 2>/dev/null
+            then
+                if [ $fail_count -ge $FAIL_THRESHOLD ]; then
+                    print_info "[INTERNET-MGR] Connection restored after $fail_count failures."
                 fi
-            done
+                fail_count=0
+                recovering=0
+            else
+                fail_count=$((fail_count + 1))
+                print_info "[INTERNET-MGR] Check FAILED ($fail_count/$FAIL_THRESHOLD)"
+                
+                if [ $fail_count -ge $FAIL_THRESHOLD ] && [ $recovering -eq 0 ]; then
+                    recovering=1
+                    
+                    if [ "$RESTART_ON_FAILURE" -eq 1 ]; then
+                        print_info "[INTERNET-MGR] Threshold reached, restarting ril-daemon..."
+                        setprop ctl.restart ril-daemon 2>/dev/null || { stop ril-daemon; start ril-daemon; }
+                        print_info "[INTERNET-MGR] Waiting 45 seconds for network to stabilize..."
+                        sleep 45
+                    else
+                        print_info "[INTERNET-MGR] Threshold reached but restart_on_failure disabled."
+                        sleep 10
+                    fi
+                    
+                    # Reset counter setelah tindakan
+                    fail_count=0
+                    sleep 5
+                    recovering=0
+                fi
+            fi
+        done
+    ) &
+    local pid=$!
+    echo "$pid" > "$INTERNET_MGR_PIDFILE"
+    log_msg "Internet Manager started PID=$pid (monitoring port $AGG_PORT)"
+}
+
+# -------------------------------------------------------------------
+#  Worker Health Check (always active)
+# -------------------------------------------------------------------
+start_worker_health_check() {
+    (
+        while true; do
+            sleep 10   # interval 10 detik untuk respons cepat
+            [ ! -f "$PIDFILE" ] && exit 0
             
-            # If no aggregator alive after handling individual failures, restart ril-daemon
-            if [ "$ANY_ALIVE" -eq 0 ] && [ "$ANY_FAILED" -eq 1 ]; then
-                print_info "[AGG-MANAGER] All aggregators dead. Triggering global network recovery."
-                restart_rild
-                # Reset all fail counts after ril restart
-                for port in $AGG_PORTS; do
-                    reset_fail_count "$port"
+            while IFS='|' read -r agg_port config_file; do
+                idx=$((agg_port - 7777))
+                base_worker=$((1080 + idx * 1000))
+                wcount=$($JQ -r '.worker_count' "$config_file" 2>/dev/null)
+                [ -z "$wcount" ] || [ "$wcount" = "null" ] && wcount=4
+                
+                worker_alive=0
+                for i in $(busybox seq 0 $((wcount - 1))); do
+                    port=$((base_worker + i))
+                    if busybox nc -z 127.0.0.1 $port 2>/dev/null; then
+                        worker_alive=1
+                        break
+                    fi
                 done
-                sleep 30
-            fi
-        done
-    ) &
-    local pid=$!
-    echo "$pid" > "$MANAGER_PIDFILE"
-    log_msg "Aggregator Manager started PID=$pid"
-}
-
-# -------------------------------------------------------------------
-#  Worker monitor (only for "no recent network activity")
-# -------------------------------------------------------------------
-start_worker_monitor() {
-    (
-        CHECK_INTERVAL=15
-        WORKER_RESTART_THRESHOLD=5
-        fail_count=0
-        
-        print_info "[WORKER-MONITOR] Started (only for 'no recent network activity')"
-        while true; do
-            sleep "$CHECK_INTERVAL"
-            if [ ! -f "$PIDFILE" ] || ! pidof clash >/dev/null; then
-                exit 0
-            fi
-            if [ -f "$LOGFILE" ]; then
-                recent_activity=$(tail -n 100 "$LOGFILE" | grep -c "no recent network activity" 2>/dev/null)
-                if [ "$recent_activity" -gt 0 ]; then
-                    fail_count=$((fail_count + recent_activity))
-                    print_info "[WORKER-MONITOR] 'no recent network activity' count: $fail_count/$WORKER_RESTART_THRESHOLD"
-                    if [ "$fail_count" -ge "$WORKER_RESTART_THRESHOLD" ]; then
-                        print_info "[WORKER-MONITOR] Restarting all workers due to persistent 'no recent activity'"
-                        killall libuz 2>/dev/null
-                        sleep 2
-                        # Restart all workers from all configs
-                        while IFS='|' read -r agg_port config_file; do
-                            idx=$((agg_port - 7777))
-                            base_port=$((1080 + idx * 1000))
-                            wcount=$($JQ -r '.worker_count' "$config_file" 2>/dev/null)
-                            [ -z "$wcount" ] || [ "$wcount" = "null" ] || [ "$wcount" -lt 1 ] && wcount=4
-                            obfs=$($JQ -r '.obfs' "$config_file" 2>/dev/null)
-                            for i in $(busybox seq 0 $((wcount - 1))); do
-                                port=$((base_port + i))
-                                json=$($JQ --arg port "$port" '.socks5.listen = "127.0.0.1:\($port)"' "$config_file")
-                                $BINDIR/libuz -s "$obfs" --config "$json" >> "$LOGFILE" 2>&1 &
-                                sleep 0.2
-                            done
-                        done < "$AGGREGATOR_MAP"
-                        sleep 5
-                        fail_count=0
-                    fi
-                else
-                    if [ "$fail_count" -gt 0 ]; then
-                        fail_count=$((fail_count - 1))
-                    fi
+                
+                if [ $worker_alive -eq 0 ]; then
+                    print_info "[WORKER-CHECK] No live workers for $agg_port -> immediate restart"
+                    
+                    # Kill instantly
+                    for i in $(busybox seq 0 $((wcount - 1))); do
+                        port=$((base_worker + i))
+                        busybox fuser -k -9 "$port/tcp" 2>/dev/null
+                    done
+                    busybox fuser -k -9 "$agg_port/tcp" 2>/dev/null
+                    killall -9 libuz libload 2>/dev/null
+                    sleep 0.3
+                    
+                    # Restart workers
+                    obfs=$($JQ -r '.obfs' "$config_file" 2>/dev/null)
+                    for i in $(busybox seq 0 $((wcount - 1))); do
+                        port=$((base_worker + i))
+                        json=$($JQ --arg port "$port" '.socks5.listen = "127.0.0.1:\($port)"' "$config_file")
+                        $BINDIR/libuz -s "$obfs" --config "$json" >> "$LOGFILE" 2>&1 &
+                    done
+                    sleep 0.3
+                    
+                    # Restart aggregator
+                    tunnel_list=""
+                    for i in $(busybox seq 0 $((wcount - 1))); do
+                        tunnel_list="$tunnel_list 127.0.0.1:$((base_worker + i))"
+                    done
+                    $BINDIR/libload -lport "$agg_port" -tunnel $tunnel_list >> "$LOGFILE" 2>&1 &
+                    
+                    sleep 1
+                    print_info "[WORKER-CHECK] Aggregator $agg_port restarted"
                 fi
-            fi
+            done < "$AGGREGATOR_MAP"
         done
     ) &
     local pid=$!
-    echo "$pid" > "$WORKER_MONITOR_PIDFILE"
-    log_msg "Worker Monitor started PID=$pid"
+    echo "$pid" > "$WORKER_CHECK_PIDFILE"
+    log_msg "Worker Health Check started PID=$pid (interval 10s)"
 }
 
 # -------------------------------------------------------------------
-#  Process a single config (start workers + aggregator)
+#  Process a single config
 # -------------------------------------------------------------------
 process_config() {
     local CONFIG_FILE="$1"
@@ -348,7 +306,6 @@ process_config() {
     [ -z "$WORKER_COUNT" ] || [ "$WORKER_COUNT" = "null" ] || [ "$WORKER_COUNT" -lt 1 ] && WORKER_COUNT=4
     [ -z "$IP_ONLY" ] || [ "$IP_ONLY" = "null" ] && { print_info "[ERROR] Invalid server IP in $PROXY_NAME"; return 1; }
     
-    # Add to server IP list for Clash bypass
     SERVER_IPS="${SERVER_IPS}$IP_ONLY "
     
     # Start workers
@@ -361,7 +318,7 @@ process_config() {
         sleep 0.1
     done
     
-    sleep 2
+    sleep 1
     if ! pidof libuz >/dev/null; then
         print_info "  Workers FAILED"
         return 1
@@ -371,10 +328,9 @@ process_config() {
     # Start aggregator
     print_info "  Starting aggregator on port $AGG_PORT..."
     $BINDIR/libload -lport "$AGG_PORT" -tunnel $TUNNEL_LIST >> "$LOGFILE" 2>&1 &
-    sleep 2
+    sleep 1
     if pidof libload >/dev/null; then
         print_info "  Aggregator on $AGG_PORT started [OK]"
-        # Store mapping
         echo "$AGG_PORT|$CONFIG_FILE" >> "$AGGREGATOR_MAP"
         echo "$PROXY_NAME|$AGG_PORT" >> "$RUNDIR/aggregators.list"
     else
@@ -385,7 +341,7 @@ process_config() {
 }
 
 # -------------------------------------------------------------------
-#  Generate Clash config from aggregators
+#  Generate Clash config
 # -------------------------------------------------------------------
 generate_clash_config() {
     local CONF_CLASH="$CLASHDIR/config.yaml"
@@ -419,20 +375,23 @@ generate_clash_config() {
 }
 
 # -------------------------------------------------------------------
-#  Main start logic
+#  Main start
 # -------------------------------------------------------------------
 start() {
     echo "--- QTUN START: $(date) ---" > "$LOGFILE"
-    log_msg "Starting QTUN Multi-Config v$VERSION with Aggregator Manager"
+    log_msg "Starting QTUN v$VERSION with Configurable Internet Manager"
     
     for bin in libuz libload clash curl yq jq; do
         [ ! -f "$BINDIR/$bin" ] && cleanup_fail "Binary $BINDIR/$bin missing"
         chmod +x "$BINDIR/$bin" 2>/dev/null
     done
     
-    killall libuz libload clash 2>/dev/null
+    killall -9 libuz libload clash 2>/dev/null
     sleep 0.5
     show_banner
+    
+    # Load internet manager settings dari config.json
+    load_manager_settings
     
     rm -f "$RUNDIR/aggregators.list" "$AGGREGATOR_MAP"
     rm -rf "$FAILCOUNT_DIR" && mkdir -p "$FAILCOUNT_DIR"
@@ -455,15 +414,19 @@ start() {
     GID_CLASH=3004
     setuidgid 0:$GID_CLASH $BINDIR/clash -d "$CLASHDIR" -f "$CLASHDIR/config.yaml" >> "$LOGFILE" 2>&1 &
     echo $! > "$PIDFILE"
-    sleep 3
+    sleep 2
     if ! pidof clash >/dev/null; then
         cleanup_fail "Clash failed to start"
     fi
     print_info "Clash started (PID $(cat $PIDFILE)) [OK]"
     
     print_info "Verifying aggregators..."
+    FIRST_AGG_PORT=""
     while IFS='|' read -r name port; do
-        if $CURL -so /dev/null -x socks5h://127.0.0.1:"$port" --connect-timeout 3 http://www.google.com 2>/dev/null; then
+        if [ -z "$FIRST_AGG_PORT" ]; then
+            FIRST_AGG_PORT="$port"
+        fi
+        if $CURL -so /dev/null -x socks5h://127.0.0.1:"$port" --connect-timeout 2 http://www.google.com 2>/dev/null; then
             print_info "  $name -> socks5://127.0.0.1:$port [OK]"
         else
             print_info "  $name -> socks5://127.0.0.1:$port [WARN] Not responding yet"
@@ -473,14 +436,19 @@ start() {
     echo ""
     echo "=========================================="
     echo "   QTUN Multi-Config is ONLINE"
-    echo "   Aggregator Manager Active"
+    if [ "$MANAGER_ENABLED" -eq 1 ]; then
+        echo "   Internet Manager: ENABLED"
+        echo "   (check every ${CHECK_INTERVAL}s, threshold $FAIL_THRESHOLD)"
+    else
+        echo "   Internet Manager: DISABLED"
+    fi
     echo "=========================================="
     echo " Clash Mixed Port: 127.0.0.1:7890"
     echo " Selector: AUTO"
     log_msg "[SUCCESS] System online with $(wc -l < "$RUNDIR/aggregators.list") aggregators."
     
-    start_aggregator_manager
-    start_worker_monitor
+    start_worker_health_check
+    start_internet_manager "$FIRST_AGG_PORT"
     start_log_rotator
 }
 
@@ -489,11 +457,11 @@ start() {
 # -------------------------------------------------------------------
 stop() {
     print_info "Stopping QTUN services..."
-    for pidf in "$MANAGER_PIDFILE" "$WORKER_MONITOR_PIDFILE" "$ROTATE_PIDFILE"; do
+    for pidf in "$MANAGER_PIDFILE" "$WORKER_CHECK_PIDFILE" "$ROTATE_PIDFILE" "$INTERNET_MGR_PIDFILE"; do
         [ -f "$pidf" ] && kill "$(cat "$pidf")" 2>/dev/null && rm -f "$pidf"
     done
-    killall libuz libload clash 2>/dev/null
-    rm -f "$PIDFILE"
+    killall -9 libuz libload clash 2>/dev/null
+    rm -f "$PIDFILE" "$MANAGER_CONFIG"
     print_info "All services stopped [OK]"
     log_msg "[STOP] Services stopped."
 }
@@ -509,9 +477,17 @@ status() {
     echo " Clash             : $(pidof clash >/dev/null && echo "Running" || echo "Stopped")"
     [ -f "$PIDFILE" ] && echo " Clash PID         : $(cat $PIDFILE)" || echo " PID File          : missing"
     [ -f "$MANAGER_PIDFILE" ] && echo " Aggregator Manager PID: $(cat $MANAGER_PIDFILE)" || echo " Aggregator Manager: Not running"
-    [ -f "$WORKER_MONITOR_PIDFILE" ] && echo " Worker Monitor PID: $(cat $WORKER_MONITOR_PIDFILE)" || echo " Worker Monitor    : Not running"
+    [ -f "$WORKER_CHECK_PIDFILE" ] && echo " Worker Health PID : $(cat $WORKER_CHECK_PIDFILE)" || echo " Worker Health     : Not running"
+    [ -f "$INTERNET_MGR_PIDFILE" ] && echo " Internet Manager PID: $(cat $INTERNET_MGR_PIDFILE)" || echo " Internet Manager  : Not running"
     [ -f "$ROTATE_PIDFILE" ] && echo " Log Rotator PID   : $(cat $ROTATE_PIDFILE)" || echo " Log Rotator       : Not running"
     echo " Log file          : $LOGFILE (rotated)"
+    
+    if [ -f "$MANAGER_CONFIG" ]; then
+        . "$MANAGER_CONFIG"
+        echo " Internet Manager  : $([ "$ENABLED" -eq 1 ] && echo "Enabled" || echo "Disabled")"
+        [ "$ENABLED" -eq 1 ] && echo "   Interval: ${CHECK_INTERVAL}s, Threshold: $FAIL_THRESHOLD"
+    fi
+    
     echo " Aggregators monitored:"
     while IFS='|' read -r port config; do
         echo "   Port $port -> $(basename "$config")"
@@ -525,10 +501,20 @@ status() {
 case "$1" in
     start)   start ;;
     stop)    stop ;;
-    restart) stop; sleep 2; start ;;
+    restart) stop; sleep 1; start ;;
     status)  status ;;
     *)
         echo "Usage: $0 {start|stop|restart|status}"
+        echo ""
+        echo "Internet Manager configuration in config.json:"
+        echo '  "internet_manager": {'
+        echo '    "enabled": true,'
+        echo '    "check_interval": 15,'
+        echo '    "fail_threshold": 2,'
+        echo '    "timeout": 8,'
+        echo '    "test_url": "http://www.google.com",'
+        echo '    "restart_on_failure": true'
+        echo '  }'
         exit 1
         ;;
 esac
