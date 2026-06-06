@@ -1,3 +1,6 @@
+# PERHATIAN!
+QTUN sekarang tidak 100% free, harus sawer paket sosmed dll.
+
 # QTUN TUNNELING Mod
 
 **Modul Magisk/KernelSU
