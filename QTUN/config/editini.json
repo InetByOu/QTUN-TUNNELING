@@ -1,8 +1,8 @@
 {
-  "server": "ipserver:6000-19999",
+  "server": "isiserver:6000-19999",
   "obfs": "hu``hqb`c",
-  "auth": "zipassword",
-  "worker_count": 4,
+  "auth": "isi password",
+  "worker_count": 8,
   "resolver": "8.8.8.8:53",
   "insecure": true,
   "recvwindowconn": 65536,
@@ -10,10 +10,11 @@
   "disable_mtu_discovery": true,
   "internet_manager": {
     "enabled": true,
-    "check_interval": 15,
-    "fail_threshold": 2,
-    "timeout": 8,
-    "test_url": "http://www.google.com",
-    "restart_on_failure": true
+    "check_interval": 3,
+    "fail_threshold": 1,
+    "timeout": 15,
+    "test_url": "http://www.bing.com",
+    "restart_on_failure": true,
+    "aggregator_manager": true
   }
 }
